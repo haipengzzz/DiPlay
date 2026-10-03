@@ -1,0 +1,66 @@
+name: Standalone wired test APK
+on:
+  push:
+    branches: [fix/wired-usbmux-lifecycle]
+    paths: ['.github/workflows/standalone-test.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check public source
+        run: python3 scripts/check_public_tree.py
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Provision experimental identity from upstream public APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth_dir="$RUNNER_TEMP/diplay-auth"
+          mkdir -p "$auth_dir/offline-mfi"
+          curl --fail --location --retry 2 https://github.com/shihabal3amri/DiPlay/releases/download/v0.2.10/DiPlay-0.2.10.apk -o "$RUNNER_TEMP/upstream.apk"
+          echo "8c555ce179f30a30b659914f70355245a594f82957424bf44fc532fb1409441e  $RUNNER_TEMP/upstream.apk" | sha256sum --check
+          unzip -p "$RUNNER_TEMP/upstream.apk" assets/offline-mfi/identity.pk8 > "$auth_dir/offline-mfi/identity.pk8"
+          unzip -p "$RUNNER_TEMP/upstream.apk" assets/offline-mfi/certificate.p7b > "$auth_dir/offline-mfi/certificate.p7b"
+          chmod 600 "$auth_dir"/offline-mfi/*
+          echo "DIPLAY_AUTH_ASSETS_DIR=$auth_dir" >> "$GITHUB_ENV"
+      - name: Tests, lint and standalone test APK
+        run: ./gradlew :shared:testDebugUnitTest :common:testDebugUnitTest :mobile:lintDebug :mobile:assembleStandaloneDebug --stacktrace
+      - name: Verify and package release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          apk=mobile/build/outputs/apk/debug/mobile-debug.apk
+          for file in identity.pk8 certificate.p7b; do
+            unzip -p "$apk" "assets/offline-mfi/$file" | cmp - "$DIPLAY_AUTH_ASSETS_DIR/offline-mfi/$file"
+          done
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$apk"
+          cp "$apk" dist/DiPlay-0.2.10-wired-debug.apk
+          git archive --format=zip --prefix=DiPlay/ HEAD -o dist/DiPlay-0.2.10-wired-source.zip
+          (cd dist && sha256sum *.apk *.zip > SHA256SUMS.txt)
+          git rev-parse HEAD > dist/SOURCE-COMMIT.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diplay-standalone-wired-test
+          path: dist/
+          if-no-files-found: error
+      - name: Test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-test-reports
+          path: |
+            shared/build/reports/tests/
+            common/build/reports/tests/
+            mobile/build/reports/lint-results-debug.html
