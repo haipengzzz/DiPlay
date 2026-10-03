@@ -2,7 +2,6 @@ name: Standalone wired test APK
 on:
   push:
     branches: [fix/wired-usbmux-lifecycle]
-    paths: ['.github/workflows/standalone-test.yml']
   workflow_dispatch:
 permissions:
   contents: read

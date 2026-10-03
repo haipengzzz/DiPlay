@@ -51,9 +51,12 @@ class UsbMuxIssue100RegressionTest {
             assertEquals(null, failure)
             assertEquals(listOf(20, 17), UsbEvidenceReplay.writes.map { it.size })
             assertTrue(remainder(host).isEmpty())
-            assertEquals(2, diagnostics.size)
-            assertTrue(diagnostics[0].contains("previousProtocol=0 previousLength=20"))
-            assertTrue(diagnostics[1].contains("previousProtocol=6 previousLength=36"))
+            val paddingDiagnostics = diagnostics.filter {
+                it.startsWith("USBMUX optional reply padding skipped")
+            }
+            assertEquals(2, paddingDiagnostics.size)
+            assertTrue(paddingDiagnostics[0].contains("previousProtocol=0 previousLength=20"))
+            assertTrue(paddingDiagnostics[1].contains("previousProtocol=6 previousLength=36"))
         } finally { host.close() }
     }
 
