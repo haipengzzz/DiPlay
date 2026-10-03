@@ -53,4 +53,16 @@ class CarPlayConnectionDiagnosticLogTest {
         assertTrue(AsyncDiagnosticLog.awaitIdle(2_000))
         assertFalse(log.contains("private-token"))
     }
+
+    @Test fun currentDiagnosticReachesScreenButOldTeardownRemainsFileOnly() {
+        val current = activity.javaClass.getDeclaredMethod("createSessionListener", Int::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(activity, 2) as AirPlaySessionListener
+        current.onDebugLog("${CarPlayController.CONNECTION_DIAGNOSTIC_PREFIX} USBMUX first completed read bytes=20")
+        listener.onDebugLog("${CarPlayController.CONNECTION_DIAGNOSTIC_PREFIX} old teardown")
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        val history = activity.javaClass.getDeclaredField("logLines").apply { isAccessible = true }
+            .get(activity) as ScreenDiagnosticBuffer
+        assertTrue(history.text().contains("first completed read"))
+        assertFalse(history.text().contains("old teardown"))
+    }
 }

@@ -1,7 +1,7 @@
 name: Android checks
 on:
   push:
-    branches: [main]
+    branches: [main, fix/wired-usbmux-lifecycle]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -24,6 +24,12 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Unit tests, lint and source-only debug build
         run: ./gradlew :shared:testDebugUnitTest :common:testDebugUnitTest :home:testDebugUnitTest :mobile:lintDebug :home:lintDebug :maphost:lintDebug :mobile:assembleDebug :home:assembleDebug :maphost:assembleDebug --stacktrace
+      - name: Upload source-only debug APK (no runtime auth identity)
+        uses: actions/upload-artifact@v4
+        with:
+          name: diplay-source-only-debug-no-auth
+          path: mobile/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
       - name: Test reports
         if: always()
         uses: actions/upload-artifact@v4

@@ -86,7 +86,6 @@ import com.shilapi.xcertplay.transport.UsbDeviceId
 import com.shilapi.xcertplay.transport.VehicleSpeedLocationProvider
 import java.io.File
 import java.text.SimpleDateFormat
-import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ExecutorService
@@ -358,7 +357,12 @@ class CarPlayHostActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val teardownExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val airPlayCommandExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private val logLines = ArrayDeque<LogEntry>()
+    private val logLines = ScreenDiagnosticBuffer()
+    private var screenLogRenderScheduled = false
+    private val renderScreenLogs = Runnable {
+        screenLogRenderScheduled = false
+        refreshLogView(System.currentTimeMillis())
+    }
     private val expireOldLogLines = Runnable { refreshLogView(System.currentTimeMillis()) }
     // Some head units (e.g. BYD DiLink) update resources.configuration for day/night
     // without delivering onConfigurationChanged, so poll while the activity is visible.
@@ -866,6 +870,7 @@ class CarPlayHostActivity : ComponentActivity() {
         dismissClusterPresentation()
         mainHandler.removeCallbacks(applyDisplaySize)
         mainHandler.removeCallbacks(expireOldLogLines)
+        mainHandler.removeCallbacks(renderScreenLogs)
         mainHandler.removeCallbacks(pollConfiguration)
         currentSurface?.let { surface ->
             sink?.clearSurface(SCREEN_TYPE_MAIN, surface)
@@ -930,11 +935,41 @@ class CarPlayHostActivity : ComponentActivity() {
             background = GradientDrawable().apply { setColor(Color.rgb(166, 200, 255)); cornerRadius = dp(20).toFloat() }
             setOnClickListener { showDiPlayHome() }
         }, LinearLayout.LayoutParams(dp(300), dp(64)))
+        val debugToggle = Button(this).apply {
+            text = getString(R.string.debug_logs); isAllCaps = false
+            setOnClickListener {
+                debugLogsEnabled = !debugLogsEnabled
+                AirPlayPersistence.saveDebugLogsEnabled(this@CarPlayHostActivity, debugLogsEnabled)
+                appendLog("Debug logs ${if (debugLogsEnabled) "enabled" else "disabled"}")
+                updateDebugOverlays()
+            }
+        }
         panel.addView(TextView(this).apply {
             text = getString(R.string.in_carplay_swipe_down_with_three_fingers_to_open_diplay_se)
             textSize = 13f; gravity = Gravity.CENTER; setTextColor(Color.rgb(168, 182, 202)); setPadding(0, dp(20), 0, 0)
         })
         root.addView(panel, FrameLayout.LayoutParams(-1, -1))
+        val logs = TextView(this).apply {
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setTextColor(Color.rgb(200, 230, 200))
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        val logScroll = ScrollView(this).apply {
+            setBackgroundColor(Color.argb(225, 0, 0, 0))
+            addView(logs, ScrollView.LayoutParams(-1, -2))
+        }
+        root.addView(logScroll, FrameLayout.LayoutParams(-1, dp(180), Gravity.TOP).apply {
+            leftMargin = dp(8); rightMargin = dp(8)
+        })
+        statusView = logs
+        statusScrollView = logScroll
+        root.addView(debugToggle, FrameLayout.LayoutParams(-2, dp(48), Gravity.BOTTOM or Gravity.END).apply {
+            rightMargin = dp(8); bottomMargin = dp(8)
+        })
+        root.post {
+            logScroll.layoutParams = logScroll.layoutParams.apply { height = (root.height / 3).coerceAtLeast(dp(80)) }
+        }
         videoView = video
         gestureOverlay = gestureLayer
         stageStatusView = stage
@@ -3135,6 +3170,10 @@ class CarPlayHostActivity : ComponentActivity() {
                 if (message.startsWith(CarPlayController.CONNECTION_DIAGNOSTIC_PREFIX + " ")) {
                     // Retain old-controller teardown evidence without accepting its UI/session state.
                     AsyncDiagnosticLog.append(diagnosticLog, message)
+                    runOnUiThread {
+                        // Older teardown evidence stays file-only; never pollute the current run.
+                        if (controllerGeneration == restartGeneration) appendScreenLog(message)
+                    }
                     return
                 }
                 runOnUiThread {
@@ -3142,7 +3181,6 @@ class CarPlayHostActivity : ComponentActivity() {
                         return@runOnUiThread
                     }
                     DisplayDiagnosticSnapshot.record(this@CarPlayHostActivity, displayDiagnosticAttempt, message)
-                    if (menuOpen) return@runOnUiThread
                     if (message.startsWith(PROTOCOL_TRACE_PREFIX)) {
                         appendFileLog(message)
                     } else {
@@ -3729,7 +3767,7 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private fun updateDebugOverlays() {
-        statusScrollView?.visibility = View.GONE
+        statusScrollView?.visibility = if (debugLogsEnabled && !menuOpen) View.VISIBLE else View.GONE
         connectionPanel?.visibility = if (activeScreenStreamTypes.isEmpty()) View.VISIBLE else View.GONE
     }
 
@@ -3754,6 +3792,17 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun appendLog(message: String) {
         val safe = DiagnosticRedactor.redact(message) ?: return
         sessionLog?.append(formattedLogLine(safe, System.currentTimeMillis()))
+        appendScreenLog(safe)
+    }
+
+    private fun appendScreenLog(message: String) {
+        val now = System.currentTimeMillis()
+        if (!logLines.append(message, now) { formattedLogLine(it, now) }) return
+        // Coalesce transport bursts: at most four text/layout updates per second.
+        if (!screenLogRenderScheduled) {
+            screenLogRenderScheduled = true
+            mainHandler.postDelayed(renderScreenLogs, 250L)
+        }
     }
 
     private fun appendFileLog(message: String) {
@@ -3778,15 +3827,16 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun refreshLogView(nowMillis: Long) {
         val cutoff = nowMillis - LOG_RETENTION_MILLIS
-        while (logLines.firstOrNull()?.timestampMillis?.let { it <= cutoff } == true) {
-            logLines.removeFirst()
-        }
-        statusView?.text = logLines.joinToString("\n") { it.text }
-        scrollLogsToBottom()
+        val followTail = statusScrollView?.let { scroll ->
+            (scroll.getChildAt(0)?.height ?: 0) <= scroll.scrollY + scroll.height + dp(24)
+        } ?: true
+        logLines.expire(cutoff)
+        statusView?.text = logLines.text()
+        if (followTail) scrollLogsToBottom()
 
         mainHandler.removeCallbacks(expireOldLogLines)
-        logLines.firstOrNull()?.let { oldest ->
-            val delay = (oldest.timestampMillis + LOG_RETENTION_MILLIS - nowMillis + 1L)
+        logLines.oldestTimestamp()?.let { oldest ->
+            val delay = (oldest + LOG_RETENTION_MILLIS - nowMillis + 1L)
                 .coerceAtLeast(1L)
             mainHandler.postDelayed(expireOldLogLines, delay)
         }
@@ -3875,7 +3925,6 @@ class CarPlayHostActivity : ComponentActivity() {
     }
 
     private data class DisplaySize(val width: Int, val height: Int)
-    private data class LogEntry(val timestampMillis: Long, val text: String)
     private data class HotspotStatus(
         val state: String,
         val ssid: String? = null,

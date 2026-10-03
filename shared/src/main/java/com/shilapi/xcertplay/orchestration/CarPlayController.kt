@@ -175,6 +175,7 @@ class CarPlayController(
         } else {
             IphoneUsbMatcher.appleVendor()
         },
+        onDiagnostic = ::connectionDiagnostic,
     )
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val touchExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -2197,6 +2198,9 @@ class CarPlayController(
 
     private fun debugLog(message: String, error: Throwable) {
         Log.w(IphoneCarPlayConfiguration.TAG, message, error)
+        generateSequence(error) { it.cause }.take(4).forEachIndexed { index, cause ->
+            connectionDiagnostic("failureCause index=$index failureClass=${diagnosticFailureClass(cause)}")
+        }
         try {
             uiListener?.onDebugLog(
                 "$message: ${error.message ?: error.javaClass.simpleName}",

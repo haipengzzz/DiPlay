@@ -37,6 +37,7 @@ class Iap2UsbMuxHost private constructor(
     ): Iap2UsbMuxTcpConnection {
         require(destinationPort in 1..0xffff) { "destinationPort must be a valid TCP port" }
         require(timeoutMillis > 0) { "timeoutMillis must be positive" }
+        diagnostic("USBMUX TCP connect destinationPort=$destinationPort timeoutMs=$timeoutMillis")
 
         val connection = synchronized(stateLock) {
             checkOpenLocked()
@@ -51,8 +52,10 @@ class Iap2UsbMuxHost private constructor(
                 connection.abort()
                 throw IphoneUsbException.TimedOut("USBMUX TCP connection to port $destinationPort timed out")
             }
+            diagnostic("USBMUX TCP connected destinationPort=$destinationPort")
             return connection
         } catch (error: IphoneUsbException) {
+            diagnostic("USBMUX TCP failed destinationPort=$destinationPort failureClass=${error.javaClass.simpleName}")
             removeConnection(connection)
             throw error
         }
@@ -105,6 +108,7 @@ class Iap2UsbMuxHost private constructor(
     }
 
     private fun begin() {
+        diagnostic("USBMUX version handshake begin timeoutMs=$HANDSHAKE_TIMEOUT_MILLIS")
         val version = ByteArray(VERSION_MESSAGE_BYTES)
         putU32(version, 0, PROTOCOL_VERSION)
         putU32(version, 4, VERSION_MESSAGE_BYTES)
@@ -123,6 +127,7 @@ class Iap2UsbMuxHost private constructor(
             val remainingMillis = (remainingNanos + NANOS_PER_MILLISECOND - 1) / NANOS_PER_MILLISECOND
             reply = takeFrame(remainingMillis)
                 ?: throw IphoneUsbException.TimedOut("Timed out waiting for the USBMUX version reply")
+            diagnostic("USBMUX handshake frame protocol=${reply.protocol} length=${reply.length} version=${reply.word8}")
             if (
                 reply.protocol == PROTOCOL_VERSION &&
                 reply.length == VERSION_MESSAGE_BYTES &&
@@ -142,6 +147,7 @@ class Iap2UsbMuxHost private constructor(
             Log.i("xcertplay-usb", "discarding stale usbmux TCP frame before version reply")
         }
         Log.i("xcertplay-usb", "usbmux version accepted: ${reply.word8}")
+        diagnostic("USBMUX version accepted=${reply.word8} staleFrames=$staleFrames")
         // Optional reply padding is handled by the incremental framer. Retain a possible
         // fragmented/coalesced next frame instead of discarding the entire remainder.
         sendFrame(PROTOCOL_SETUP, byteArrayOf(SETUP_VALUE.toByte()))
@@ -149,7 +155,10 @@ class Iap2UsbMuxHost private constructor(
             isDaemon = true
             start()
         }
+        diagnostic("USBMUX setup sent; reader started")
     }
+
+    private fun diagnostic(message: String) { runCatching { onDiagnostic(message) } }
 
     /** Reads one complete USBMUX frame, keeping partial data buffered across reads. */
     private fun takeFrame(timeoutMillis: Long): UsbMuxFrame? {
@@ -295,6 +304,7 @@ class Iap2UsbMuxHost private constructor(
                 try {
                     it.begin()
                 } catch (error: Throwable) {
+                    it.diagnostic("USBMUX handshake failed failureClass=${error.javaClass.simpleName}")
                     it.close()
                     throw error
                 }
