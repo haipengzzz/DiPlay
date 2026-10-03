@@ -957,7 +957,7 @@ class CarPlayHostActivity : ComponentActivity() {
         }
         val logScroll = ScrollView(this).apply {
             setBackgroundColor(Color.argb(225, 0, 0, 0))
-            addView(logs, ScrollView.LayoutParams(-1, -2))
+            addView(logs, FrameLayout.LayoutParams(-1, -2))
         }
         root.addView(logScroll, FrameLayout.LayoutParams(-1, dp(180), Gravity.TOP).apply {
             leftMargin = dp(8); rightMargin = dp(8)
