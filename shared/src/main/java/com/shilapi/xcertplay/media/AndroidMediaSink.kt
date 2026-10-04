@@ -781,11 +781,14 @@ private class AudioRenderer(
     private val mediaBufferMillis: Int,
     private val report: (String) -> Unit,
 ) : Closeable {
-    private data class AudioPacket(val rtp: ByteArray, val sample: Int)
+    private data class AudioPacket(val rtp: ByteArray, val sample: Int, val receivedNs: Long = System.nanoTime())
 
     private var trackAttributes: AudioAttributes? = null
     private var mappedChannel: AudioChannel? = null
     private val queue = LinkedBlockingQueue<AudioPacket>(MAX_QUEUED_PACKETS)
+    private val backlogPolicy = AudioBacklogPolicy(mediaBufferMillis)
+    private var latencyDroppedPackets = 0L
+    private var backlogCatchUps = 0
     @Volatile private var running = true
     @Volatile private var started = false
     private var codec: MediaCodec? = null
@@ -863,6 +866,10 @@ private class AudioRenderer(
             createTrack()
             requestAudioFocus()
             while (running) {
+                // Observe an exhausted hardware buffer before adding another packet;
+                // otherwise a nonempty incoming queue can hide a real underrun.
+                maintainPlaybackBuffer()
+                catchUpMediaBacklog()
                 queue.poll(AUDIO_POLL_MILLIS, TimeUnit.MILLISECONDS)?.let(::handle)
                 // Output becomes ready asynchronously, including after the last packet of a burst.
                 // Waiting for the next UDP packet can strand decoded sound for hundreds of ms.
@@ -1305,18 +1312,42 @@ private class AudioRenderer(
     private fun maintainPlaybackBuffer() {
         val track = track ?: return
         if (bufferProgress.shouldRebuffer(mappedChannel == AudioChannel.MEDIA, playbackStarted,
-                track.underrunCount > underrunsAtPlaybackStart, queue.isEmpty(), track.playbackHeadPosition)) {
+                track.underrunCount > underrunsAtPlaybackStart, queue.isEmpty(), track.playbackHeadPosition,
+                canRebufferWithQueuedPackets = format.codec == AudioCodecKind.LPCM)) {
             // The hardware buffer has actually drained. Pause without flushing or discarding PCM,
             // then use the configured start threshold again when music resumes.
             track.pause()
             playbackStarted = false
             prebufferBytes = 0
             rebufferCount++
+            report("Audio: rebuffer audioType=${format.audioType} incomingQueue=${queue.size}")
         }
         // A short final burst may never reach the start threshold. Play it after a bounded wait.
         if (!playbackStarted && prebufferBytes > 0 && queue.isEmpty() &&
             System.nanoTime() - lastPcmWriteNs >= BUFFER_TAIL_WAIT_NS) {
             startPlayback(track)
+        }
+    }
+
+    private fun catchUpMediaBacklog() {
+        val now = System.nanoTime()
+        val oldest = queue.peek() ?: return
+        val age = now - oldest.receivedNs
+        if (!backlogPolicy.shouldCatchUp(age, mappedChannel == AudioChannel.MEDIA,
+                format.codec == AudioCodecKind.LPCM, playbackStarted)) return
+        var dropped = 0
+        while (running) {
+            val packet = queue.peek() ?: break
+            if (!backlogPolicy.shouldDiscard(now - packet.receivedNs)) break
+            if (queue.poll() != null) dropped++
+        }
+        if (dropped > 0) {
+            packetsDropped.addAndGet(dropped)
+            latencyDroppedPackets += dropped
+            backlogCatchUps++
+            fadeApplied = false
+            report("Audio: catch-up audioType=${format.audioType} droppedOld=$dropped " +
+                "oldestAgeMs=${age / 1_000_000} remainingQueue=${queue.size}")
         }
     }
 
@@ -1350,7 +1381,9 @@ private class AudioRenderer(
             "estimatedQueuedFrames=${queuedFrames ?: -1} writeErrors=$writeErrorsThisWindow " +
             "lastWriteError=${lastWriteErrorCode ?: "none"} zeroWrites=$zeroWritesThisWindow " +
             "partialWrites=$partialWritesThisWindow " +
-            "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount ended=$force"
+            "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount " +
+            "queueOldestAgeMs=${queue.peek()?.let { (now - it.receivedNs) / 1_000_000 } ?: 0} " +
+            "latencyDroppedTotal=$latencyDroppedPackets catchUps=$backlogCatchUps ended=$force"
         Log.i(STATS_TAG, line)
         report(line)
         statsLastUnderruns = underruns
