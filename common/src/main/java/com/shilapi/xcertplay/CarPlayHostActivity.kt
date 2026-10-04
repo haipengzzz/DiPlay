@@ -3121,7 +3121,10 @@ class CarPlayHostActivity : ComponentActivity() {
             audioCaptureDirectory = audioCaptureDirectory(),
         )
 
-    private fun createSessionListener(controllerGeneration: Int): AirPlaySessionListener =
+    private fun createSessionListener(
+        controllerGeneration: Int,
+        wirelessTransport: Boolean = wirelessEnabled,
+    ): AirPlaySessionListener =
         object : AirPlaySessionListener {
             private val diagnosticLog = sessionLog
 
@@ -3131,6 +3134,9 @@ class CarPlayHostActivity : ComponentActivity() {
                         return@runOnUiThread
                     }
                     activeAirPlaySession = session
+                    StartupConnectionPreference.rememberSuccessfulTransport(
+                        this@CarPlayHostActivity, controller?.usesWirelessTransport() ?: wirelessTransport,
+                    )
                     CarPlayBackgroundSession.active = true
                     reconnectAttempts = 0
                     syncAirPlayDarkMode()
@@ -3317,7 +3323,7 @@ class CarPlayHostActivity : ComponentActivity() {
             airPlayConfig = airPlayConfig,
             identity = airPlayIdentity,
             pairings = pairings,
-            listener = createSessionListener(controllerGeneration),
+            listener = createSessionListener(controllerGeneration, config.transport == CarPlayTransport.WIRELESS),
             media = media,
             reportStatus = createStatusReporter(controllerGeneration),
             loadPairRecord = { AirPlayPersistence.loadLockdownRecord(this) },

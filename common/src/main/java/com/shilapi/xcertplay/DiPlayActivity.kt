@@ -92,6 +92,7 @@ class DiPlayActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        initialLaunch = savedInstanceState == null
         languagePreferenceAtCreate = AppLocale.preference(this)
         com.shilapi.xcertplay.hud.BydNavigationOutputs.onAppOpened(applicationContext)
         WindowCompat.setDecorFitsSystemWindows(window, true)
@@ -118,6 +119,9 @@ class DiPlayActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent); setIntent(intent)
+        if (intent.getBooleanExtra(StartupConnectionPreference.EXTRA_BOOT_AUTO_CONNECT, false)) {
+            initialLaunch = true
+        }
         page = intent.getStringExtra("page") ?: "home"; render()
         handleWirelessRecovery()
     }
@@ -151,9 +155,15 @@ class DiPlayActivity : ComponentActivity() {
         if (!initialLaunch && (page == "home" || page == "settings" || page == "connection")) render()
         if (initialLaunch) {
             initialLaunch = false
+            val fromBoot = StartupConnectionPreference.consumeBootAutoConnect(
+                intent, AirPlayPersistence.loadAutoStartOnBoot(this),
+            )
             if (setupError == null && !CarPlayBackgroundSession.hasSession() &&
-                DiPlayPreferences.autoConnect(this) && intent.getStringExtra("page") == null) {
-                handler.post { connect(AirPlayPersistence.loadWirelessEnabled(this)) }
+                (fromBoot || DiPlayPreferences.autoConnect(this)) && intent.getStringExtra("page") == null) {
+                val wireless = StartupConnectionPreference.wirelessForAutoConnect(
+                    this, AirPlayPersistence.loadWirelessEnabled(this),
+                )
+                handler.post { if (!isFinishing && !isDestroyed) connect(wireless) }
             }
         }
     }
@@ -1050,6 +1060,7 @@ class DiPlayActivity : ComponentActivity() {
                     appendLine(StartupDiagnosticSnapshot.report(appContext))
                     appendLine("Startup settings: openAfterBoot=${AirPlayPersistence.loadAutoStartOnBoot(appContext)} " +
                         "connectWhenOpened=${DiPlayPreferences.autoConnect(appContext)}")
+                    appendLine(StartupConnectionPreference.report(appContext))
                     appendLine()
                     for (name in SessionLogFile.REPORT_NAMES) {
                         val file = File(appContext.filesDir, "logs/$name")

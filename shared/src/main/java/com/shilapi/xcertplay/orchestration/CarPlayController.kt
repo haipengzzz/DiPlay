@@ -365,6 +365,7 @@ class CarPlayController(
     }
 
     fun isClosed(): Boolean = closed
+    fun usesWirelessTransport(): Boolean = config.transport == CarPlayTransport.WIRELESS
 
     fun hasActiveAirPlayAttachment(): Boolean = synchronized(lifecycleLock) {
         !closed && vpnService?.isAttached() == true
