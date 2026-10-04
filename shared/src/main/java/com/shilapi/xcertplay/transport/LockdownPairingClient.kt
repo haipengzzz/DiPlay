@@ -14,6 +14,7 @@ import java.security.GeneralSecurityException
  */
 class LockdownPairingClient(
     private val host: Iap2UsbMuxHost,
+    private val onDiagnostic: (String) -> Unit = {},
 ) {
     /**
      * Fetches the two pairing inputs, generates the local record, and sends plaintext Pair.
@@ -68,11 +69,17 @@ class LockdownPairingClient(
                     )
                 }
                 Log.i(TAG, "lockdown pair attempt=$attempt")
-                val response = channel.request(pairRequest(label, record), stepTimeoutMillis(deadline))
+                val response = request(channel, pairRequest(label, record), stepTimeoutMillis(deadline), "Pair")
                 checkCancelled(isCancelled)
                 when (val error = response.errorCodeOrNull()) {
-                    null -> return PairedRecord(record, response.entries["EscrowBag"].asOptionalData())
-                    "PairingDialogResponsePending" -> pending = true
+                    null -> {
+                        diagnostic("Lockdown pairing accepted attempt=$attempt")
+                        return PairedRecord(record, response.entries["EscrowBag"].asOptionalData())
+                    }
+                    "PairingDialogResponsePending" -> {
+                        diagnostic("Lockdown trust pending; unlock iPhone and accept trust prompt")
+                        pending = true
+                    }
                     "UserDeniedPairing" -> throw LockdownPairingException.UserDeniedPairing
                     "PasswordProtected" -> throw LockdownPairingException.PasswordProtected
                     else -> throw LockdownPairingException.RemoteError(error)
@@ -99,12 +106,36 @@ class LockdownPairingClient(
         val wifiAddress = getValue(channel, label, "WiFiAddress", deadline, isCancelled)
             as? LockdownPlistValue.Text
             ?: throw LockdownPairingException.InvalidResponse("WiFiAddress was not text")
+        diagnostic("Lockdown generating local pairing certificates")
         return LockdownPairRecordGenerator.generate(
             devicePublicKeyPkcs1Pem = devicePublicKey.bytes,
             wifiAddress = wifiAddress.value,
             hostId = hostId,
             systemBuid = systemBuid,
         )
+    }
+
+    private fun diagnostic(message: String) {
+        Log.i(TAG, message)
+        runCatching { onDiagnostic(message) }
+    }
+
+    private fun request(
+        channel: LockdownPlistChannel,
+        body: LockdownPlistValue.Dictionary,
+        timeoutMillis: Long,
+        operation: String,
+    ): LockdownPlistValue.Dictionary {
+        diagnostic("Lockdown request=$operation begin timeoutMs=$timeoutMillis")
+        val started = System.nanoTime()
+        try {
+            return channel.request(body, timeoutMillis).also {
+                diagnostic("Lockdown request=$operation completed elapsedMs=${(System.nanoTime() - started) / 1_000_000} error=${it.errorCodeOrNull() ?: "none"}")
+            }
+        } catch (error: Exception) {
+            diagnostic("Lockdown request=$operation failed elapsedMs=${(System.nanoTime() - started) / 1_000_000} failureClass=${error.javaClass.simpleName}")
+            throw error
+        }
     }
 
     private fun pairRequest(
@@ -130,7 +161,8 @@ class LockdownPairingClient(
         isCancelled: () -> Boolean,
     ) {
         checkCancelled(isCancelled)
-        val response = channel.request(
+        val response = request(
+            channel,
             LockdownPlistValue.Dictionary(
                 linkedMapOf(
                     "Label" to LockdownPlistValue.Text(label),
@@ -140,6 +172,7 @@ class LockdownPairingClient(
                 ),
             ),
             stepTimeoutMillis(deadline),
+            "SetValue UntrustedHostBUID",
         )
         checkCancelled(isCancelled)
         response.errorCodeOrNull()?.let { throw LockdownPairingException.RemoteError(it) }
@@ -154,7 +187,8 @@ class LockdownPairingClient(
         isCancelled: () -> Boolean,
     ): LockdownPlistValue {
         checkCancelled(isCancelled)
-        val response = channel.request(
+        val response = request(
+            channel,
             LockdownPlistValue.Dictionary(
                 linkedMapOf(
                     "Label" to LockdownPlistValue.Text(label),
@@ -163,6 +197,7 @@ class LockdownPairingClient(
                 ),
             ),
             stepTimeoutMillis(deadline),
+            "GetValue $key",
         )
         checkCancelled(isCancelled)
         response.errorCodeOrNull()?.let { throw LockdownPairingException.RemoteError(it) }

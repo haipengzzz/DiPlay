@@ -1,7 +1,7 @@
 name: Android checks
 on:
   push:
-    branches: [main, fix/wired-usbmux-lifecycle]
+    branches: [main, fix/wired-usbmux-lifecycle, fix/wired-network-diagnostics]
   pull_request:
   workflow_dispatch:
 permissions:
