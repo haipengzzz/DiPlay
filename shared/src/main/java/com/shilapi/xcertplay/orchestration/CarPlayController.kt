@@ -49,6 +49,7 @@ import com.shilapi.xcertplay.network.WirelessInterfaceDiagnostics
 import com.shilapi.xcertplay.network.WirelessStartupDiagnostics
 import com.shilapi.xcertplay.transport.BlockingDuplexByteStream
 import com.shilapi.xcertplay.transport.BluetoothRfcommDuplexStream
+import com.shilapi.xcertplay.transport.BluetoothServiceDiscovery
 import com.shilapi.xcertplay.transport.Ch341DeviceMatcher
 import com.shilapi.xcertplay.transport.Ch341I2cTransport
 import com.shilapi.xcertplay.transport.Ch341UsbHost
@@ -1044,12 +1045,22 @@ class CarPlayController(
             }
 
             onStatus(CarPlayStatus.ConnectingBluetooth)
+            val iap2Service = UUID.fromString(IAP2_IPHONE_UUID)
+            if (device.uuids?.any { it.uuid == iap2Service } != true) {
+                connectionDiagnostic("Bluetooth iAP2 absent from cache; refreshing selected device services")
+                BluetoothServiceDiscovery.refresh(
+                    appContext, device, iap2Service,
+                    cancelled = { isStaleWirelessRun(generation) },
+                    report = ::connectionDiagnostic,
+                )
+            }
+            if (isStaleWirelessRun(generation)) return
             debugLog(
                 "wireless RFCOMM connecting address=${device.address} " +
                     "uuid=$IAP2_IPHONE_UUID",
             )
             val socket = device
-                    .createRfcommSocketToServiceRecord(UUID.fromString(IAP2_IPHONE_UUID))
+                    .createRfcommSocketToServiceRecord(iap2Service)
                     .also { bluetoothSocket = it }
             logBluetoothConnectionSnapshot(device, "before-connect")
             val bluetoothStarted = System.nanoTime()
@@ -1062,6 +1073,9 @@ class CarPlayController(
                         "failureClass=${diagnosticFailureClass(error)}",
                 )
                 logBluetoothConnectionSnapshot(device, "after-failure")
+                error.cause?.stackTrace?.firstOrNull()?.let {
+                    connectionDiagnostic("Bluetooth cause origin=${it.className}.${it.methodName} line=${it.lineNumber}")
+                }
                 throw error
             }
             debugLog("wireless RFCOMM connected address=${device.address}")
