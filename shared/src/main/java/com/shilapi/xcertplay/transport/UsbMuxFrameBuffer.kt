@@ -14,10 +14,18 @@ internal class UsbMuxFrameBuffer(private val diagnostic: (String) -> Unit = {}) 
     private var optionalReplyPadding: UsbMuxFrame? = null
     private var paddingReports = 0
     private var lastUsbReadBytes = 0
+    private var usbReads = 0L
+    private var receivedBytes = 0L
+    private var consumedBytes = 0L
+    private var parsedFrames = 0L
+    private var lastFrameProtocol: Int? = null
+    private var lastFrameLength = 0
     val bufferedBytes: Int get() = bytes.size
 
     fun append(transfer: ByteArray) {
         lastUsbReadBytes = transfer.size
+        usbReads++
+        receivedBytes += transfer.size
         bytes += transfer
     }
 
@@ -47,6 +55,7 @@ internal class UsbMuxFrameBuffer(private val diagnostic: (String) -> Unit = {}) 
                 readU16(bytes, PADDING_BYTES + HEADER_BYTES) != 0 &&
                 readU16(bytes, PADDING_BYTES + HEADER_BYTES + 2) != 0) {
                 bytes = bytes.copyOfRange(PADDING_BYTES, bytes.size)
+                consumedBytes += PADDING_BYTES
                 optionalReplyPadding = null
                 if (paddingReports++ < MAX_PADDING_REPORTS) report(
                     "USBMUX optional reply padding skipped bytes=$PADDING_BYTES " +
@@ -57,7 +66,9 @@ internal class UsbMuxFrameBuffer(private val diagnostic: (String) -> Unit = {}) 
                 length = readU32(bytes, 4)
             } else {
                 report("USBMUX framing rejected declaredLength=$length bufferedBytes=${bytes.size} " +
-                    "lastUsbReadBytes=$lastUsbReadBytes optionalReplyPadding=${previous != null}")
+                    "lastUsbReadBytes=$lastUsbReadBytes optionalReplyPadding=${previous != null} " +
+                    "usbReads=$usbReads receivedBytes=$receivedBytes consumedBytes=$consumedBytes " +
+                    "parsedFrames=$parsedFrames lastFrameProtocol=$lastFrameProtocol lastFrameLength=$lastFrameLength")
                 throw IphoneUsbException.Protocol("Invalid USBMUX frame length $length")
             }
         }
@@ -68,6 +79,10 @@ internal class UsbMuxFrameBuffer(private val diagnostic: (String) -> Unit = {}) 
             payload = bytes.copyOfRange(HEADER_BYTES, length),
         )
         bytes = bytes.copyOfRange(length, bytes.size)
+        consumedBytes += length
+        parsedFrames++
+        lastFrameProtocol = frame.protocol
+        lastFrameLength = frame.length
         optionalReplyPadding = frame.takeIf(::canHaveOptionalReplyPadding)
         return frame
     }

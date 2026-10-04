@@ -1593,7 +1593,7 @@ class CarPlayController(
             this.mux = mux
             debugLog("wired USBMUX host opened")
             onStatus(CarPlayStatus.Pairing)
-            val pairingClient = LockdownPairingClient(mux)
+            val pairingClient = LockdownPairingClient(mux, onDiagnostic = ::connectionDiagnostic)
             val savedPairRecord = loadPairRecord()
             var pairRecord = savedPairRecord ?: pairNewRecord(pairingClient)
             debugLog(

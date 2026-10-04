@@ -96,7 +96,7 @@ class CarPlayVpnService : VpnService() {
                 ?: throw IOException("VpnService.establish returned null")
             tun = tunFd
 
-            val ipv6Bridge = Ipv6NcmBridge(ncm, tunFd, hostMac) { error ->
+            val ipv6Bridge = Ipv6NcmBridge(ncm, tunFd, hostMac, onDiagnostic = listener::onDebugLog) { error ->
                 onTransportError(generation, listener, error)
             }
             ipv6Bridge.start()
@@ -169,6 +169,7 @@ class CarPlayVpnService : VpnService() {
             Log.w(TAG, "AirPlay port $busy is in use; listening on $bound instead")
         }
         attachment = replacement.copy(config = replacement.config.copy(port = server.localPort))
+        runCatching { replacement.listener.onDebugLog("AirPlay listener ready port=${server.localPort} family=${if (replacement.address is Inet6Address) "IPv6" else "IPv4"}") }
         serverSocket = server
         Thread(
             { acceptLoop(generation, server) },

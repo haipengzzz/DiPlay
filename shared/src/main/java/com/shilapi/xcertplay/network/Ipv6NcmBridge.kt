@@ -9,6 +9,7 @@ import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.LockSupport
 
@@ -23,6 +24,7 @@ class Ipv6NcmBridge(
     private val ncm: NcmUsbBridge,
     private val tun: ParcelFileDescriptor,
     private val hostMac: ByteArray,
+    private val onDiagnostic: (String) -> Unit = {},
     private val onError: (Throwable) -> Unit,
 ) : Closeable {
     init {
@@ -33,15 +35,22 @@ class Ipv6NcmBridge(
     private var peerMac: ByteArray? = null
     private var loggedInbound = false
     private var loggedOutbound = false
+    private var loggedOutboundDiagnostic = false
     private var loggedWaitingForPeer = false
     private var inboundLogBudget = 16
     private var outboundLogBudget = 24
+    private val inboundFrames = AtomicLong()
+    private val inboundIpv6 = AtomicLong()
+    private val tunPackets = AtomicLong()
+    private val outboundAttempts = AtomicLong()
+    private var lastProgressNanos = 0L
     private val running = AtomicBoolean(false)
     private lateinit var ncmToTunThread: Thread
     private lateinit var tunToNcmThread: Thread
 
     fun start() {
         check(running.compareAndSet(false, true)) { "bridge is already started" }
+        progress(force = true)
         ncmToTunThread = Thread(::runNcmToTun, "ncm-ipv6-in").apply {
             isDaemon = true
             start()
@@ -64,9 +73,14 @@ class Ipv6NcmBridge(
         val output = FileOutputStream(tun.fileDescriptor)
         try {
             while (running.get()) {
-                val frame = ncm.recv(READ_TIMEOUT_MILLIS) ?: continue
+                val frame = ncm.recv(READ_TIMEOUT_MILLIS)
+                progress()
+                if (frame == null) continue
+                inboundFrames.incrementAndGet()
                 val ipv6 = EthernetIpv6Codec.parseIpv6View(frame) ?: continue
+                inboundIpv6.incrementAndGet()
                 peerMac = ipv6.sourceMac
+                if (!loggedInbound) diagnostic("NCM first inbound IPv6 bytes=${ipv6.payloadLength}")
                 if (!loggedInbound) {
                     loggedInbound = true
                     Log.i(
@@ -77,6 +91,7 @@ class Ipv6NcmBridge(
                 }
                 if (inboundLogBudget > 0) {
                     inboundLogBudget--
+                    diagnosticPacket("inbound", frame, ipv6.payloadOffset)
                     Log.i(TAG, "ncm inbound ${frame.summary(ipv6.payloadOffset)}")
                 }
                 output.write(frame, ipv6.payloadOffset, ipv6.payloadLength)
@@ -104,6 +119,7 @@ class Ipv6NcmBridge(
                     LockSupport.parkNanos(ZERO_READ_BACKOFF_NANOS)
                     continue
                 }
+                tunPackets.incrementAndGet()
                 val tunPacket = buffer.copyOf(length)
                 val ipv6 = EthernetIpv6Codec.addNeighborAdvertisementTargetMac(tunPacket, hostMac)
                 if (ipv6.size != tunPacket.size) {
@@ -111,6 +127,7 @@ class Ipv6NcmBridge(
                 }
                 if (outboundLogBudget > 0) {
                     outboundLogBudget--
+                    diagnosticPacket("outbound", ipv6, 0)
                     Log.i(TAG, "ncm outbound ${ipv6.summary(0)}")
                 }
                 val multicastMac = EthernetIpv6Codec.multicastDestinationMac(ipv6)
@@ -118,6 +135,7 @@ class Ipv6NcmBridge(
                 if (mac == null) {
                     if (!loggedWaitingForPeer) {
                         loggedWaitingForPeer = true
+                        diagnostic("NCM outbound unicast waiting for peer MAC")
                         Log.i(TAG, "ncm deferred outbound unicast bytes=$length until peer MAC is learned")
                     }
                     continue
@@ -130,13 +148,45 @@ class Ipv6NcmBridge(
                     )
                 }
                 val frame = EthernetIpv6Codec.build(hostMac, mac, ipv6)
+                outboundAttempts.incrementAndGet()
+                if (!loggedOutboundDiagnostic) {
+                    loggedOutboundDiagnostic = true
+                    diagnostic("NCM first outbound attempt bytes=${ipv6.size} multicast=${multicastMac != null}")
+                }
                 ncm.send(frame, WRITE_TIMEOUT_MILLIS)
+                progress()
             }
         } catch (error: IOException) {
             if (running.get()) onError(error)
         } catch (error: RuntimeException) {
             if (running.get()) onError(error)
         }
+    }
+
+    private fun diagnosticPacket(direction: String, packet: ByteArray, offset: Int) {
+        val bytes = packet.size - offset
+        if (bytes < 40) return
+        val next = packet[offset + 6].toInt() and 0xff
+        val detail = when {
+            next == 6 && bytes >= 44 -> " tcp=${packet.u16(offset + 40)}->${packet.u16(offset + 42)}"
+            next == 17 && bytes >= 44 -> " udp=${packet.u16(offset + 40)}->${packet.u16(offset + 42)}"
+            next == 58 && bytes >= 41 -> " icmp6=${packet[offset + 40].toInt() and 0xff}"
+            else -> ""
+        }
+        diagnostic("NCM $direction bytes=$bytes next=$next$detail")
+    }
+
+    private fun diagnostic(message: String) {
+        runCatching { onDiagnostic(message) }
+    }
+
+    @Synchronized
+    private fun progress(force: Boolean = false) {
+        val now = System.nanoTime()
+        if (!force && now - lastProgressNanos < 10_000_000_000L) return
+        lastProgressNanos = now
+        diagnostic("NCM network inboundFrames=${inboundFrames.get()} inboundIpv6=${inboundIpv6.get()} " +
+            "tunPackets=${tunPackets.get()} outboundAttempts=${outboundAttempts.get()} peerMacKnown=${peerMac != null}")
     }
 
     private fun join(thread: Thread) {
