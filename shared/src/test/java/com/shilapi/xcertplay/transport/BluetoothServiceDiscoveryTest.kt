@@ -14,6 +14,7 @@ import org.mockito.ArgumentMatchers.eq
 import org.mockito.Mockito.*
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowBluetoothDevice
 import java.io.IOException
 import java.util.UUID
 
@@ -21,15 +22,13 @@ import java.util.UUID
 @Config(manifest = Config.NONE, sdk = [28])
 class BluetoothServiceDiscoveryTest {
     private val service = UUID.fromString("00000000-deca-fade-deca-deafdecacafe")
-    private val device = mock(BluetoothDevice::class.java).also {
-        `when`(it.address).thenReturn("01:02:03:04:05:06")
-    }
+    private val device = ShadowBluetoothDevice.newInstance("01:02:03:04:05:06")
     private val context = mock(Context::class.java)
+    private var requestSdp: () -> Boolean = { false }
 
     @Test fun unavailableSdpStillUnregistersAndAllowsNormalConnection() {
-        `when`(device.fetchUuidsWithSdp()).thenReturn(false)
         val logs = mutableListOf<String>()
-        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add)
+        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add, requestSdp = requestSdp)
         verify(context).unregisterReceiver(any(BroadcastReceiver::class.java))
         assertTrue(logs.any { it.contains("requested=false") })
     }
@@ -38,23 +37,23 @@ class BluetoothServiceDiscoveryTest {
         var receiver: BroadcastReceiver? = null
         `when`(context.registerReceiver(any(BroadcastReceiver::class.java), any(IntentFilter::class.java)))
             .thenAnswer { receiver = it.getArgument(0); null }
-        `when`(device.fetchUuidsWithSdp()).thenAnswer {
+        requestSdp = {
             receiver!!.onReceive(context, Intent(BluetoothDevice.ACTION_UUID)
                 .putExtra(BluetoothDevice.EXTRA_DEVICE, device)
                 .putExtra(BluetoothDevice.EXTRA_UUID, arrayOf(ParcelUuid(service))))
             true
         }
         val logs = mutableListOf<String>()
-        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add)
+        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add, requestSdp = requestSdp)
         assertTrue(logs.any { it.contains("iap2=true") })
         assertFalse(logs.joinToString().contains(device.address))
         verify(context).unregisterReceiver(receiver)
     }
 
     @Test fun timeoutIsBoundedAndCleansReceiver() {
-        `when`(device.fetchUuidsWithSdp()).thenReturn(true)
+        requestSdp = { true }
         val logs = mutableListOf<String>()
-        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add, timeoutMillis = 1)
+        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add, timeoutMillis = 1, requestSdp = requestSdp)
         assertTrue(logs.any { it.contains("timed out") })
         verify(context).unregisterReceiver(any(BroadcastReceiver::class.java))
     }
@@ -63,34 +62,33 @@ class BluetoothServiceDiscoveryTest {
         var receiver: BroadcastReceiver? = null
         `when`(context.registerReceiver(any(BroadcastReceiver::class.java), any(IntentFilter::class.java)))
             .thenAnswer { receiver = it.getArgument(0); null }
-        val other = mock(BluetoothDevice::class.java)
-        `when`(other.address).thenReturn("01:02:03:04:05:07")
-        `when`(device.fetchUuidsWithSdp()).thenAnswer {
+        val other = ShadowBluetoothDevice.newInstance("01:02:03:04:05:07")
+        requestSdp = {
             receiver!!.onReceive(context, Intent(BluetoothDevice.ACTION_UUID)
                 .putExtra(BluetoothDevice.EXTRA_DEVICE, other)
                 .putExtra(BluetoothDevice.EXTRA_UUID, arrayOf(ParcelUuid(service))))
             true
         }
         val logs = mutableListOf<String>()
-        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add, timeoutMillis = 1)
+        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add, timeoutMillis = 1, requestSdp = requestSdp)
         assertFalse(logs.any { it.contains("SDP result") })
         assertTrue(logs.any { it.contains("timed out") })
         verify(context).unregisterReceiver(receiver)
     }
 
     @Test fun OemDiscoveryFailureDoesNotPreventNormalConnectAndCleansReceiver() {
-        `when`(device.fetchUuidsWithSdp()).thenThrow(NullPointerException())
+        requestSdp = { throw NullPointerException() }
         val logs = mutableListOf<String>()
-        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add)
+        BluetoothServiceDiscovery.refresh(context, device, service, { false }, logs::add, requestSdp = requestSdp)
         assertTrue(logs.any { it.contains("failureClass=NullPointerException") })
         verify(context).unregisterReceiver(any(BroadcastReceiver::class.java))
     }
 
     @Test fun cancellationAfterStartingDiscoveryCleansReceiver() {
         var cancelled = false
-        `when`(device.fetchUuidsWithSdp()).thenAnswer { cancelled = true; true }
+        requestSdp = { cancelled = true; true }
         try {
-            BluetoothServiceDiscovery.refresh(context, device, service, { cancelled }, {})
+            BluetoothServiceDiscovery.refresh(context, device, service, { cancelled }, {}, requestSdp = requestSdp)
             fail("Expected cancellation")
         } catch (expected: IOException) {
             assertTrue(expected.message!!.contains("cancelled"))
@@ -99,8 +97,7 @@ class BluetoothServiceDiscoveryTest {
     }
 
     @Test @Config(sdk = [33]) fun android13UsesExportedReceiverForSystemBluetoothBroadcasts() {
-        `when`(device.fetchUuidsWithSdp()).thenReturn(false)
-        BluetoothServiceDiscovery.refresh(context, device, service, { false }, {})
+        BluetoothServiceDiscovery.refresh(context, device, service, { false }, {}, requestSdp = requestSdp)
         verify(context).registerReceiver(any(BroadcastReceiver::class.java), any(IntentFilter::class.java), eq(Context.RECEIVER_EXPORTED))
         verify(context).unregisterReceiver(any(BroadcastReceiver::class.java))
     }

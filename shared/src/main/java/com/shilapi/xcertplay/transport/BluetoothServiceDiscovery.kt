@@ -22,6 +22,7 @@ internal object BluetoothServiceDiscovery {
         cancelled: () -> Boolean,
         report: (String) -> Unit,
         timeoutMillis: Long = 8_000,
+        requestSdp: () -> Boolean = device::fetchUuidsWithSdp,
     ) {
         if (cancelled()) throw IOException("Bluetooth service discovery cancelled")
         val completed = CountDownLatch(1)
@@ -45,7 +46,7 @@ internal object BluetoothServiceDiscovery {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
             } else context.registerReceiver(receiver, filter)
             registered = true
-            val started = device.fetchUuidsWithSdp()
+            val started = requestSdp()
             report("Bluetooth SDP requested=$started timeoutMs=$timeoutMillis")
             if (!started) return // Keep the normal secure RFCOMM lookup as fallback.
             val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
