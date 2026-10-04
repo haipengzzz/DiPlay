@@ -5,6 +5,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class NoticeLogRotationTest {
+    @Test fun firstNoticeCreatesItsLogDirectoryWithoutResettingHistory() {
+        val dir = Files.createTempDirectory("diplay-first-notice").toFile()
+        try {
+            val current = dir.resolve("logs/ui-notices.log")
+            SessionLogFile(current, listOf("ui-notices-previous.log")).use { it.append("First notice") }
+            assertTrue(current.readText().contains("First notice"))
+        } finally { dir.deleteRecursively() }
+    }
     @Test fun noticeRotationNeverOverwritesSessionHistory() {
         val dir = Files.createTempDirectory("diplay-notices").toFile()
         try {

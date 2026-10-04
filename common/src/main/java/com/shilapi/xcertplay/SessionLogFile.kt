@@ -22,6 +22,7 @@ internal class SessionLogFile(
         if (closed) return@synchronized
         val safe = DiagnosticRedactor.redact(line) ?: return@synchronized
         runCatching {
+            file.parentFile?.mkdirs()
             if (file.length() > MAX_BYTES) {
                 rotate()
                 file.writeText("")

@@ -1133,7 +1133,8 @@ class DiPlayActivity : ComponentActivity() {
                 }
             }
         }
-        val safe = DiagnosticRedactor.redact(message) ?: return
+        val safe = DiagnosticRedactor.redact(message.replace('\n', ' ').replace('\r', ' '))
+            ?: "UI notice details=omitted"
         Log.i("DiPlayNotice", safe)
         AsyncDiagnosticLog.append(noticeLog, safe)
     }
