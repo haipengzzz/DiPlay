@@ -1,7 +1,5 @@
 name: Standalone wired test APK
 on:
-  push:
-    branches: [fix/wired-usbmux-lifecycle]
   workflow_dispatch:
 permissions:
   contents: read
