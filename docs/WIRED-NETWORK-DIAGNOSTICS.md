@@ -9,6 +9,8 @@ whether the network path, USB framing, or device disconnection is the root cause
 The screen and exported report now include:
 
 - Lockdown request name, begin/completion/failure, duration and error code.
+- USBMUX framing failures include the previous frame protocol/length and total
+  received/consumed bytes, to help locate where framing became misaligned.
 - Explicit pending-trust and accepted-pairing messages.
 - AirPlay listener readiness and actual port.
 - NCM inbound Ethernet/IPv6 counts, TUN packet count, outbound attempt count and
