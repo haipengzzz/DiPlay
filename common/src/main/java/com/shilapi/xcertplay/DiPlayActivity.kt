@@ -65,6 +65,12 @@ class DiPlayActivity : ComponentActivity() {
     private var exportButton: Button? = null
     private var adbStatus: TextView? = null
     private var adbCheckGeneration = 0
+    private var noticeMessage: String? = null
+    private var noticeActions: List<Pair<String, () -> Unit>> = emptyList()
+    private var noticeContainer: LinearLayout? = null
+    private val noticeLog by lazy {
+        SessionLogFile(File(filesDir, "logs/ui-notices.log"), listOf("ui-notices-previous.log"))
+    }
     private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
         connect(notificationTransport)
     }
@@ -92,6 +98,7 @@ class DiPlayActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        initialLaunch = savedInstanceState == null
         languagePreferenceAtCreate = AppLocale.preference(this)
         com.shilapi.xcertplay.hud.BydNavigationOutputs.onAppOpened(applicationContext)
         WindowCompat.setDecorFitsSystemWindows(window, true)
@@ -118,6 +125,9 @@ class DiPlayActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent); setIntent(intent)
+        if (intent.getBooleanExtra(StartupConnectionPreference.EXTRA_BOOT_AUTO_CONNECT, false)) {
+            initialLaunch = true
+        }
         page = intent.getStringExtra("page") ?: "home"; render()
         handleWirelessRecovery()
     }
@@ -126,7 +136,7 @@ class DiPlayActivity : ComponentActivity() {
     private fun openOverlayPermission() {
         val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
         if (runCatching { startActivity(intent) }.isFailure) {
-            android.widget.Toast.makeText(this, R.string.center_map_no_permission_screen, android.widget.Toast.LENGTH_LONG).show()
+            toast(getString(R.string.center_map_no_permission_screen))
         }
     }
 
@@ -151,9 +161,15 @@ class DiPlayActivity : ComponentActivity() {
         if (!initialLaunch && (page == "home" || page == "settings" || page == "connection")) render()
         if (initialLaunch) {
             initialLaunch = false
+            val fromBoot = StartupConnectionPreference.consumeBootAutoConnect(
+                intent, AirPlayPersistence.loadAutoStartOnBoot(this),
+            )
             if (setupError == null && !CarPlayBackgroundSession.hasSession() &&
-                DiPlayPreferences.autoConnect(this) && intent.getStringExtra("page") == null) {
-                handler.post { connect(AirPlayPersistence.loadWirelessEnabled(this)) }
+                (fromBoot || DiPlayPreferences.autoConnect(this)) && intent.getStringExtra("page") == null) {
+                val wireless = StartupConnectionPreference.wirelessForAutoConnect(
+                    this, AirPlayPersistence.loadWirelessEnabled(this),
+                )
+                handler.post { if (!isFinishing && !isDestroyed) connect(wireless) }
             }
         }
     }
@@ -173,6 +189,8 @@ class DiPlayActivity : ComponentActivity() {
         }, LinearLayout.LayoutParams(dp(130), dp(56)))
         content.addView(header)
         content.addView(space(24))
+        noticeContainer = card().also { content.addView(it) }
+        updateNotice()
         when (page) {
             "connection" -> connectionSetup(content)
             "settings" -> settings(content)
@@ -263,6 +281,10 @@ class DiPlayActivity : ComponentActivity() {
             card.addView(button(getString(R.string.open_connection_setup), false) { page = "connection"; render() }, matchButton(12, 60))
         }
         section(content, getString(R.string.diagnostics), R.drawable.ic_dp_diagnostics) { card ->
+            toggle(card, getString(R.string.debug_logs), getString(R.string.show_on_screen_debug_logs),
+                AirPlayPersistence.loadDebugLogsEnabled(this)) {
+                AirPlayPersistence.saveDebugLogsEnabled(this, it)
+            }
             exportButton = button(if (exportInProgress) getString(R.string.saving_report) else getString(R.string.save_diagnostic_report), false) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) exportDiagnostics()
                 else chooseReportDestination()
@@ -506,11 +528,9 @@ class DiPlayActivity : ComponentActivity() {
             com.shilapi.xcertplay.network.CarHotspotStatus.isEnabled(this) == false
 
     private fun carHotspotOffDialog() {
-        AlertDialog.Builder(this).setTitle(getString(R.string.car_hotspot_is_off))
-            .setMessage(getString(R.string.msg_car_hotspot_connect, AirPlayPersistence.loadManualHotspotSsid(this)))
-            .setPositiveButton(getString(R.string.open_car_settings)) { _, _ -> openCarWifiSettings() }
-            .setNeutralButton(getString(R.string.connect)) { _, _ -> connect(true) }
-            .setNegativeButton(getString(R.string.cancel), null).show()
+        showNotice(getString(R.string.car_hotspot_is_off) + "\n" +
+            getString(R.string.msg_car_hotspot_connect, AirPlayPersistence.loadManualHotspotSsid(this)),
+            listOf(getString(R.string.open_car_settings) to { openCarWifiSettings() }))
     }
 
     // BYD maps the AOSP tether action to its own hotspot screen; other firmware falls back to Wi-Fi settings.
@@ -913,17 +933,17 @@ class DiPlayActivity : ComponentActivity() {
         }
         val adapter = getSystemService(BluetoothManager::class.java)?.adapter
         if (adapter == null || !adapter.isEnabled) {
-            AlertDialog.Builder(this).setTitle(getString(R.string.turn_on_bluetooth))
-                .setMessage(getString(R.string.enable_the_car_s_bluetooth_and_pair_your_iphone_first))
-                .setPositiveButton(getString(R.string.open_bluetooth)) { _, _ -> openSystem(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
-                .setNegativeButton(getString(R.string.later), null).show(); return
+            showNotice(getString(R.string.turn_on_bluetooth) + "\n" +
+                getString(R.string.enable_the_car_s_bluetooth_and_pair_your_iphone_first),
+                listOf(getString(R.string.open_bluetooth) to { openSystem(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }))
+            return
         }
         val devices = runCatching { adapter.bondedDevices.sortedBy { it.name ?: "" } }.getOrDefault(emptyList())
         if (devices.isEmpty()) {
-            AlertDialog.Builder(this).setTitle(getString(R.string.pair_your_iphone))
-                .setMessage(getString(R.string.on_your_iphone_open_settings_bluetooth_and_pair_with_the_c))
-                .setPositiveButton(getString(R.string.open_bluetooth)) { _, _ -> openSystem(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
-                .setNegativeButton(getString(R.string.got_it), null).show(); return
+            showNotice(getString(R.string.pair_your_iphone) + "\n" +
+                getString(R.string.on_your_iphone_open_settings_bluetooth_and_pair_with_the_c),
+                listOf(getString(R.string.open_bluetooth) to { openSystem(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }))
+            return
         }
         AlertDialog.Builder(this).setTitle(getString(R.string.choose_your_iphone))
             .setItems(devices.map { device ->
@@ -1050,8 +1070,16 @@ class DiPlayActivity : ComponentActivity() {
                     appendLine(StartupDiagnosticSnapshot.report(appContext))
                     appendLine("Startup settings: openAfterBoot=${AirPlayPersistence.loadAutoStartOnBoot(appContext)} " +
                         "connectWhenOpened=${DiPlayPreferences.autoConnect(appContext)}")
+                    appendLine(StartupConnectionPreference.report(appContext))
                     appendLine()
                     for (name in SessionLogFile.REPORT_NAMES) {
+                        val file = File(appContext.filesDir, "logs/$name")
+                        if (file.isFile) {
+                            appendLine("--- $name ---")
+                            file.useLines { lines -> lines.forEach { line -> DiagnosticRedactor.redact(line)?.let { appendLine(it) } } }
+                        }
+                    }
+                    for (name in listOf("ui-notices-previous.log", "ui-notices.log")) {
                         val file = File(appContext.filesDir, "logs/$name")
                         if (file.isFile) {
                             appendLine("--- $name ---")
@@ -1070,10 +1098,9 @@ class DiPlayActivity : ComponentActivity() {
                 exportButton?.apply { isEnabled = true; text = getString(R.string.save_diagnostic_report) }
                 if (result.isSuccess) {
                     val savedUri = result.getOrThrow()
-                    AlertDialog.Builder(this).setTitle(getString(R.string.diagnostic_report_saved))
-                        .setMessage(if (uri == null) "Downloads/DiPlay/$fileName" else getString(R.string.your_report_was_saved_to_the_selected_location))
-                        .setPositiveButton(getString(R.string.done), null)
-                        .setNeutralButton(getString(R.string.share)) { _, _ ->
+                    showNotice(getString(R.string.diagnostic_report_saved) + "\n" +
+                        (if (uri == null) "Downloads/DiPlay/$fileName" else getString(R.string.your_report_was_saved_to_the_selected_location)),
+                        listOf(getString(R.string.share) to {
                             runCatching {
                                 startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
                                     type = "text/plain"; putExtra(Intent.EXTRA_STREAM, savedUri)
@@ -1081,23 +1108,59 @@ class DiPlayActivity : ComponentActivity() {
                                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }, getString(R.string.share_diagnostic_report)))
                             }.onFailure { toast(getString(R.string.report_saved_open_it_from_your_file_manager_to_share_it)) }
-                        }.show()
+                        }))
                 } else {
-                    AlertDialog.Builder(this).setTitle(getString(R.string.could_not_save_the_report))
-                        .setMessage(getString(R.string.check_that_storage_is_available_or_choose_another_save_loc))
-                        .setPositiveButton(getString(R.string.choose_location)) { _, _ -> chooseReportDestination() }
-                        .setNegativeButton(getString(R.string.close), null).show()
+                    showNotice(getString(R.string.could_not_save_the_report) + "\n" +
+                        getString(R.string.check_that_storage_is_available_or_choose_another_save_loc),
+                        listOf(getString(R.string.choose_location) to { chooseReportDestination() }))
                 }
             }
         }, "diplay-export").start()
     }
     private fun permissionHelp(title: String, body: String) {
-        AlertDialog.Builder(this).setTitle(title).setMessage(body).setPositiveButton(getString(R.string.app_settings)) { _, _ ->
+        showNotice(title + "\n" + body, listOf(getString(R.string.app_settings) to {
             openSystem(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
-        }.setNegativeButton(getString(R.string.later), null).show()
+        }))
     }
     private fun openSystem(intent: Intent) { runCatching { startActivity(intent) }.onFailure { toast(getString(R.string.open_this_setting_from_your_car_s_settings_app)) } }
-    private fun toast(message: String) { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
+    // Replace informational Toasts with an inline panel; never rebuild an input form to show a notice.
+    private fun toast(message: String) { showNotice(message) }
+
+    private fun showNotice(message: String, actions: List<Pair<String, () -> Unit>> = emptyList()) {
+        noticeMessage = message
+        noticeActions = actions
+        updateNotice()
+        noticeContainer?.let { panel ->
+            panel.post {
+                if (panel === noticeContainer && panel.visibility == View.VISIBLE) {
+                    panel.requestRectangleOnScreen(android.graphics.Rect(0, 0, panel.width, panel.height), false)
+                }
+            }
+        }
+        val safe = DiagnosticRedactor.redact(message.replace('\n', ' ').replace('\r', ' '))
+            ?: "UI notice details=omitted"
+        Log.i("DiPlayNotice", safe)
+        AsyncDiagnosticLog.append(noticeLog, safe)
+    }
+
+    private fun updateNotice() {
+        val panel = noticeContainer ?: return
+        panel.removeAllViews()
+        val message = noticeMessage
+        panel.visibility = if (message == null) View.GONE else View.VISIBLE
+        if (message == null) return
+        panel.addView(label(message, 16, TEXT).apply {
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        })
+        for ((title, action) in noticeActions) {
+            panel.addView(button(title, false) { action() }, matchButton(10, 56))
+        }
+        panel.addView(button(getString(R.string.close), false) {
+            noticeMessage = null
+            noticeActions = emptyList()
+            updateNotice()
+        }, matchButton(10, 56))
+    }
 
     private fun playTestTone(streamType: Int) {
         toneStop?.let { handler.removeCallbacks(it) }

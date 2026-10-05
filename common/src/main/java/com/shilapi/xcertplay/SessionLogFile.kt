@@ -4,7 +4,10 @@ import java.io.Closeable
 import java.io.File
 
 /** Bounded, private diagnostics. Each write is redacted before touching storage. */
-internal class SessionLogFile(val file: File) : Closeable {
+internal class SessionLogFile(
+    val file: File,
+    private val archiveNames: List<String> = ARCHIVE_NAMES,
+) : Closeable {
     private val lock = Any()
     private var closed = false
     fun reset(header: String) = synchronized(lock) {
@@ -19,6 +22,7 @@ internal class SessionLogFile(val file: File) : Closeable {
         if (closed) return@synchronized
         val safe = DiagnosticRedactor.redact(line) ?: return@synchronized
         runCatching {
+            file.parentFile?.mkdirs()
             if (file.length() > MAX_BYTES) {
                 rotate()
                 file.writeText("")
@@ -29,12 +33,12 @@ internal class SessionLogFile(val file: File) : Closeable {
     }
     private fun rotate() {
         if (!file.exists() || file.length() == 0L) return
-        for (index in ARCHIVE_NAMES.lastIndex downTo 1) {
-            val source = File(file.parentFile, ARCHIVE_NAMES[index - 1])
-            val destination = File(file.parentFile, ARCHIVE_NAMES[index])
+        for (index in archiveNames.lastIndex downTo 1) {
+            val source = File(file.parentFile, archiveNames[index - 1])
+            val destination = File(file.parentFile, archiveNames[index])
             if (source.exists()) source.copyTo(destination, overwrite = true)
         }
-        file.copyTo(File(file.parentFile, ARCHIVE_NAMES.first()), overwrite = true)
+        archiveNames.firstOrNull()?.let { file.copyTo(File(file.parentFile, it), overwrite = true) }
     }
     override fun close() = synchronized(lock) { closed = true }
     companion object {

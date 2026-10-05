@@ -415,6 +415,7 @@ private class VideoDecoder(
     private var renderedFrameLogged = false
     private var submittedFrameLogged = false
     private var duplicateConfigLogged = false
+    private val recoveryPolicy = VideoRecoveryPolicy()
     private val referenceChain = VideoReferenceChain()
     private var lastKeyFrameRequestNs = 0L
     // The main screen keeps the historical log format; other screens are labelled.
@@ -447,9 +448,9 @@ private class VideoDecoder(
                     when (job) {
                         is VideoJob.Config -> configureDecoder(job)
                         is VideoJob.Frame -> {
-                            if (System.nanoTime() - job.receivedNs > MAX_FRAME_AGE_NS) {
+                            if (System.nanoTime() - job.receivedNs > recoveryPolicy.frameAgeLimitNs(renderedFrameLogged)) {
                                 queue.discardFrames()
-                                recover("video backlog exceeded 250 ms")
+                                recover("video backlog exceeded ${recoveryPolicy.frameAgeLimitNs(renderedFrameLogged) / 1_000_000} ms")
                             } else feed(job.nalus)
                         }
                         is VideoJob.SurfaceChanged -> changeSurface(job.surface)
@@ -487,6 +488,9 @@ private class VideoDecoder(
             }
             return
         }
+        if (previous == null || previous.codec != config.codec || !previous.codecData.contentEquals(config.codecData)) {
+            recoveryPolicy.reset()
+        }
         lastConfig = config
         duplicateConfigLogged = false
         releaseDecoder()
@@ -508,10 +512,14 @@ private class VideoDecoder(
         }
         // Some vendor decoders (e.g. MediaTek c2.mtk.avc.decoder) reject the tuned
         // parameters with BAD_VALUE. Fall back to a minimal format, then to software.
-        val attempts = listOf(
-            DecoderAttempt(codecName = null, tuned = true),
-            DecoderAttempt(codecName = null, tuned = false),
-        ) + softwareDecoderName(mime)?.let { listOf(DecoderAttempt(it, tuned = false)) }.orEmpty()
+        val software = softwareDecoderName(mime)
+        val vendorAttempts = if (recoveryPolicy.tier < 2 || software == null) {
+            if (recoveryPolicy.tier == 0) listOf(
+                DecoderAttempt(codecName = null, tuned = true),
+                DecoderAttempt(codecName = null, tuned = false),
+            ) else listOf(DecoderAttempt(codecName = null, tuned = false))
+        } else emptyList()
+        val attempts = vendorAttempts + software?.let { listOf(DecoderAttempt(it, tuned = false)) }.orEmpty()
         var next: MediaCodec? = null
         for (attempt in attempts) {
             next = tryConfigure(mime, csd, surface, attempt)
@@ -524,7 +532,7 @@ private class VideoDecoder(
         renderedFrameLogged = false
         submittedFrameLogged = false
         if (next != null) {
-            report("decoder=${next.name} mime=$mime size=${width}x$height")
+            report("decoder=${next.name} mime=$mime size=${width}x$height recoveryTier=${recoveryPolicy.tier}")
             Log.i(
                 TAG,
                 "video decoder configured name=${next.name} mime=$mime size=${width}x$height",
@@ -574,9 +582,10 @@ private class VideoDecoder(
     }
 
     private fun softwareDecoderName(mime: String): String? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null
         return MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.firstOrNull {
-            !it.isEncoder && it.isSoftwareOnly && mime in it.supportedTypes
+            !it.isEncoder && mime in it.supportedTypes &&
+                (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) it.isSoftwareOnly
+                 else isLegacySoftwareDecoder(it.name))
         }?.name
     }
 
@@ -662,8 +671,13 @@ private class VideoDecoder(
         Log.w(TAG, "Video recovery: $reason; waiting for keyframe")
         stats.onRecovery()
         report("recovery: $reason; waiting for keyframe")
-        // Recreate with codec-specific data: flush can discard CSD before the first output.
-        releaseDecoder()
+        val hadOutput = renderedFrameLogged
+        val escalated = recoveryPolicy.onRecovery(hadOutput)
+        if (escalated) report("startup recovery escalated tier=${recoveryPolicy.tier}")
+        // A delayed frame breaks the reference chain, not necessarily the codec. Keep
+        // a working decoder and its CSD; rebuild only for stalls/errors or escalation.
+        val backlogOnly = reason.startsWith("video backlog") || reason == "video queue overflow"
+        if (!backlogOnly || escalated || !hadOutput) releaseDecoder()
         referenceChain.reset()
         requestKeyFrameIfDue()
     }
@@ -740,7 +754,6 @@ private class VideoDecoder(
         const val TAG = "xcertplay-usb"
         const val MAX_INPUT_SIZE = 8 * 1024 * 1024
         const val INPUT_TIMEOUT_US = 10_000L
-        const val MAX_FRAME_AGE_NS = 250_000_000L
         val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
     }
 }
@@ -768,11 +781,14 @@ private class AudioRenderer(
     private val mediaBufferMillis: Int,
     private val report: (String) -> Unit,
 ) : Closeable {
-    private data class AudioPacket(val rtp: ByteArray, val sample: Int)
+    private data class AudioPacket(val rtp: ByteArray, val sample: Int, val receivedNs: Long = System.nanoTime())
 
     private var trackAttributes: AudioAttributes? = null
     private var mappedChannel: AudioChannel? = null
     private val queue = LinkedBlockingQueue<AudioPacket>(MAX_QUEUED_PACKETS)
+    private val backlogPolicy = AudioBacklogPolicy(mediaBufferMillis)
+    private var latencyDroppedPackets = 0L
+    private var backlogCatchUps = 0
     @Volatile private var running = true
     @Volatile private var started = false
     private var codec: MediaCodec? = null
@@ -850,6 +866,10 @@ private class AudioRenderer(
             createTrack()
             requestAudioFocus()
             while (running) {
+                // Observe an exhausted hardware buffer before adding another packet;
+                // otherwise a nonempty incoming queue can hide a real underrun.
+                maintainPlaybackBuffer()
+                catchUpMediaBacklog()
                 queue.poll(AUDIO_POLL_MILLIS, TimeUnit.MILLISECONDS)?.let(::handle)
                 // Output becomes ready asynchronously, including after the last packet of a burst.
                 // Waiting for the next UDP packet can strand decoded sound for hundreds of ms.
@@ -1292,18 +1312,42 @@ private class AudioRenderer(
     private fun maintainPlaybackBuffer() {
         val track = track ?: return
         if (bufferProgress.shouldRebuffer(mappedChannel == AudioChannel.MEDIA, playbackStarted,
-                track.underrunCount > underrunsAtPlaybackStart, queue.isEmpty(), track.playbackHeadPosition)) {
+                track.underrunCount > underrunsAtPlaybackStart, queue.isEmpty(), track.playbackHeadPosition,
+                canRebufferWithQueuedPackets = format.codec == AudioCodecKind.LPCM)) {
             // The hardware buffer has actually drained. Pause without flushing or discarding PCM,
             // then use the configured start threshold again when music resumes.
             track.pause()
             playbackStarted = false
             prebufferBytes = 0
             rebufferCount++
+            report("Audio: rebuffer audioType=${format.audioType} incomingQueue=${queue.size}")
         }
         // A short final burst may never reach the start threshold. Play it after a bounded wait.
         if (!playbackStarted && prebufferBytes > 0 && queue.isEmpty() &&
             System.nanoTime() - lastPcmWriteNs >= BUFFER_TAIL_WAIT_NS) {
             startPlayback(track)
+        }
+    }
+
+    private fun catchUpMediaBacklog() {
+        val now = System.nanoTime()
+        val oldest = queue.peek() ?: return
+        val age = now - oldest.receivedNs
+        if (!backlogPolicy.shouldCatchUp(age, mappedChannel == AudioChannel.MEDIA,
+                format.codec == AudioCodecKind.LPCM, playbackStarted)) return
+        var dropped = 0
+        while (running) {
+            val packet = queue.peek() ?: break
+            if (!backlogPolicy.shouldDiscard(now - packet.receivedNs)) break
+            if (queue.poll() != null) dropped++
+        }
+        if (dropped > 0) {
+            packetsDropped.addAndGet(dropped)
+            latencyDroppedPackets += dropped
+            backlogCatchUps++
+            fadeApplied = false
+            report("Audio: catch-up audioType=${format.audioType} droppedOld=$dropped " +
+                "oldestAgeMs=${age / 1_000_000} remainingQueue=${queue.size}")
         }
     }
 
@@ -1337,7 +1381,9 @@ private class AudioRenderer(
             "estimatedQueuedFrames=${queuedFrames ?: -1} writeErrors=$writeErrorsThisWindow " +
             "lastWriteError=${lastWriteErrorCode ?: "none"} zeroWrites=$zeroWritesThisWindow " +
             "partialWrites=$partialWritesThisWindow " +
-            "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount ended=$force"
+            "decoderDroppedTotal=$inputDropped outputBuffersTotal=$outputBuffers rebuffers=$rebufferCount " +
+            "queueOldestAgeMs=${queue.peek()?.let { (now - it.receivedNs) / 1_000_000 } ?: 0} " +
+            "latencyDroppedTotal=$latencyDroppedPackets catchUps=$backlogCatchUps ended=$force"
         Log.i(STATS_TAG, line)
         report(line)
         statsLastUnderruns = underruns

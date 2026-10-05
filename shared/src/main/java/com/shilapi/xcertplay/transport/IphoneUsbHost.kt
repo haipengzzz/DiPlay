@@ -355,6 +355,7 @@ class Iap2UsbSession internal constructor(
     private var failure: IphoneUsbException? = null
     private var readRequest: UsbRequest? = null
     private var readQueued = false
+    private var queueReplacementUsed = false
     private val readBuffer = ByteBuffer.allocateDirect(USBMUX_READ_CHUNK_BYTES)
     private val ioDiagnostics = ConnectionIoDiagnostics(report = { line ->
         diagnostic(line.replace("wired io", "wired usbmux io"))
@@ -400,7 +401,7 @@ class Iap2UsbSession internal constructor(
             // Publish and queue atomically with close(); close must not miss a new request.
             val request = synchronized(stateLock) {
                 checkOpenLocked()
-                val current = readRequest ?: requestFactory().also {
+                var current = readRequest ?: requestFactory().also {
                     readRequest = it
                     diagnostic("USBMUX read initialize ${requestDiagnostics(timeoutMillis, readBuffer.capacity())}")
                     if (!it.initialize(connection, inEndpoint)) {
@@ -410,7 +411,26 @@ class Iap2UsbSession internal constructor(
                 if (!readQueued) {
                     readBuffer.clear()
                     if (!current.queue(readBuffer)) {
-                        throw failSession("Android could not queue USBMUX read request (${requestDiagnostics(timeoutMillis, readBuffer.capacity())})")
+                        if (queueReplacementUsed) {
+                            throw failSession("Android could not queue USBMUX read request (${requestDiagnostics(timeoutMillis, readBuffer.capacity())})")
+                        }
+                        // queue(false) has not submitted a request. Replace only that idle
+                        // request once, never cancel a pending read or retry partial data.
+                        queueReplacementUsed = true
+                        diagnostic("USBMUX idle read queue rejected; replacing request once")
+                        readRequest = null
+                        current.close()
+                        val replacement = requestFactory()
+                        if (replacement === current) {
+                            throw failSession("Android could not queue USBMUX read request (replacement was not fresh)")
+                        }
+                        readRequest = replacement
+                        current = replacement
+                        readBuffer.clear()
+                        if (!replacement.initialize(connection, inEndpoint) || !replacement.queue(readBuffer)) {
+                            throw failSession("Android could not queue USBMUX read request after replacement (${requestDiagnostics(timeoutMillis, readBuffer.capacity())})")
+                        }
+                        diagnostic("USBMUX idle read request replacement queued successfully")
                     }
                     readQueued = true
                 }
