@@ -616,6 +616,10 @@ class CarPlayHostActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (!menuOpen) {
+            debugLogsEnabled = AirPlayPersistence.loadDebugLogsEnabled(this)
+            updateDebugOverlays()
+        }
         val languagePreference = AppLocale.preference(this)
         if (Build.VERSION.SDK_INT < 33 && languagePreference != languagePreferenceAtCreate) {
             languagePreferenceAtCreate = languagePreference
