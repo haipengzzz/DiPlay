@@ -14,6 +14,7 @@ class BootReceiver : BroadcastReceiver() {
         if (!launchEnabled) return
 
         val launch = Intent(context, DiPlayActivity::class.java).apply {
+            putExtra(StartupConnectionPreference.EXTRA_BOOT_AUTO_CONNECT, true)
             addFlags(
                 Intent.FLAG_ACTIVITY_NEW_TASK or
                     Intent.FLAG_ACTIVITY_CLEAR_TOP or

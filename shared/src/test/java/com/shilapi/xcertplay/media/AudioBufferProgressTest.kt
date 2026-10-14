@@ -4,6 +4,14 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class AudioBufferProgressTest {
+    @Test fun lpcmRebuffersExhaustedHardwareEvenWhenIncomingPacketsAreWaiting() {
+        val buffer = AudioBufferProgress(4)
+        buffer.written(4000)
+        assertFalse(buffer.shouldRebuffer(true, true, true, false, 999, true))
+        assertTrue(buffer.shouldRebuffer(true, true, true, false, 1000, true))
+        assertFalse(buffer.shouldRebuffer(true, true, false, false, 1000, true))
+        assertFalse(buffer.shouldRebuffer(false, true, true, false, 1000, true))
+    }
     @Test fun musicRebuffersOnlyAfterHardwareAndIncomingQueuesDrain() {
         val buffer = AudioBufferProgress(4)
         buffer.written(4000)

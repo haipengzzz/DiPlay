@@ -25,8 +25,9 @@ class CarPlayConnectionDiagnosticLogTest {
         activity = Robolectric.buildActivity(CarPlayHostActivity::class.java).get()
         activity.javaClass.getDeclaredMethod("initializeSessionLog").apply { isAccessible = true }.invoke(activity)
         activity.javaClass.getDeclaredField("restartGeneration").apply { isAccessible = true }.set(activity, 2)
-        listener = activity.javaClass.getDeclaredMethod("createSessionListener", Int::class.javaPrimitiveType)
-            .apply { isAccessible = true }.invoke(activity, 1) as AirPlaySessionListener
+        listener = activity.javaClass.getDeclaredMethod("createSessionListener", Int::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(activity, 1, false) as AirPlaySessionListener
     }
 
     @After fun cleanup() {
@@ -55,8 +56,9 @@ class CarPlayConnectionDiagnosticLogTest {
     }
 
     @Test fun currentDiagnosticReachesScreenButOldTeardownRemainsFileOnly() {
-        val current = activity.javaClass.getDeclaredMethod("createSessionListener", Int::class.javaPrimitiveType)
-            .apply { isAccessible = true }.invoke(activity, 2) as AirPlaySessionListener
+        val current = activity.javaClass.getDeclaredMethod("createSessionListener", Int::class.javaPrimitiveType,
+            Boolean::class.javaPrimitiveType)
+            .apply { isAccessible = true }.invoke(activity, 2, false) as AirPlaySessionListener
         current.onDebugLog("${CarPlayController.CONNECTION_DIAGNOSTIC_PREFIX} USBMUX first completed read bytes=20")
         listener.onDebugLog("${CarPlayController.CONNECTION_DIAGNOSTIC_PREFIX} old teardown")
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()

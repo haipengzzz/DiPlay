@@ -101,6 +101,70 @@ class Iap2UsbSessionLifecycleTest {
         verify(connection).close()
     }
 
+    @Test fun idleQueueRejectionCanRecoverWithOneFreshRequest() {
+        val replacement = mock(UsbRequest::class.java)
+        val input = mock(UsbEndpoint::class.java)
+        `when`(request.initialize(connection, input)).thenReturn(true)
+        `when`(request.queue(any(ByteBuffer::class.java))).thenReturn(false)
+        `when`(replacement.initialize(connection, input)).thenReturn(true)
+        `when`(replacement.queue(any(ByteBuffer::class.java))).thenAnswer {
+            buffer = it.getArgument(0); true
+        }
+        var calls = 0
+        session = Iap2UsbSession(connection, mock(UsbEndpoint::class.java), input, usbInterface,
+            onDiagnostic = diagnostics::add) { if (calls++ == 0) request else replacement }
+        `when`(connection.requestWait(anyLong())).thenAnswer {
+            buffer.put(byteArrayOf(4, 5)); replacement
+        }
+        assertArrayEquals(byteArrayOf(4, 5), session.read(10))
+        assertEquals(2, calls)
+        verify(request).close()
+        verify(request, never()).cancel()
+        verify(connection, never()).close()
+        session.close()
+        verify(replacement).close()
+        verify(connection).close()
+        assertTrue(diagnostics.any { it.contains("replacement queued successfully") })
+    }
+
+    @Test fun replacementBudgetIsFiniteAndSecondFailureClosesEverything() {
+        val replacement = mock(UsbRequest::class.java)
+        val input = mock(UsbEndpoint::class.java)
+        `when`(request.initialize(connection, input)).thenReturn(true)
+        `when`(request.queue(any(ByteBuffer::class.java))).thenReturn(false)
+        `when`(replacement.initialize(connection, input)).thenReturn(true)
+        `when`(replacement.queue(any(ByteBuffer::class.java))).thenAnswer {
+            buffer = it.getArgument(0); true
+        }.thenReturn(false)
+        var calls = 0
+        session = Iap2UsbSession(connection, mock(UsbEndpoint::class.java), input, usbInterface,
+            onDiagnostic = diagnostics::add) { if (calls++ == 0) request else replacement }
+        `when`(connection.requestWait(anyLong())).thenAnswer { buffer.put(1.toByte()); replacement }
+        assertArrayEquals(byteArrayOf(1), session.read(10))
+        expectFailure("could not queue") { session.read(10) }
+        assertEquals(2, calls)
+        verify(request).close()
+        verify(replacement).close()
+        verify(connection).close()
+    }
+
+    @Test fun detachedDeviceCannotBeHiddenByFreshRequestFailure() {
+        val replacement = mock(UsbRequest::class.java)
+        val input = mock(UsbEndpoint::class.java)
+        `when`(request.initialize(connection, input)).thenReturn(true)
+        `when`(request.queue(any(ByteBuffer::class.java))).thenReturn(false)
+        `when`(replacement.initialize(connection, input)).thenReturn(false)
+        var calls = 0
+        session = Iap2UsbSession(connection, mock(UsbEndpoint::class.java), input, usbInterface) {
+            if (calls++ == 0) request else replacement
+        }
+        expectFailure("after replacement") { session.read(10) }
+        verify(request).close()
+        verify(replacement).close()
+        verify(connection).close()
+        verify(connection, never()).requestWait(anyLong())
+    }
+
     @Test fun throwingInitializeDoesNotLeakRequest() {
         `when`(request.initialize(any(UsbDeviceConnection::class.java), any(UsbEndpoint::class.java)))
             .thenThrow(IllegalStateException("OEM failure"))
